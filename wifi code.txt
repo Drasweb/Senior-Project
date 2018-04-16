@@ -1,0 +1,269 @@
+#include "mbed.h"
+#include "wifi.h"
+
+/*------------------------------------------------------------------------------
+Hyperterminal settings: 115200 bauds, 8-bit data, no parity
+
+This example
+  - connects to a wifi network (SSID & PWD to set in mbed_app.json)
+  - displays the IP address and creates a web page
+  - then connect on its IP address on the same wifi network with another device
+  - Now able to change the led status and read the temperature
+
+This example uses SPI3 ( PE_0 PC_10 PC_12 PC_11), wifi_wakeup pin (PB_13),
+wifi_dataready pin (PE_1), wifi reset pin (PE_8)
+------------------------------------------------------------------------------*/
+
+/* Private defines -----------------------------------------------------------*/
+#define WIFI_WRITE_TIMEOUT 10000
+#define WIFI_READ_TIMEOUT  10000
+#define PORT               80
+
+/* Private typedef------------------------------------------------------------*/
+typedef enum 
+{
+    WS_IDLE = 0,
+    WS_CONNECTED,
+    WS_DISCONNECTED,
+    WS_ERROR,
+}   WebServerState_t;
+
+/* Private macro -------------------------------------------------------------*/
+static int wifi_sample_run(void);
+static void WebServerProcess(void);
+static WIFI_Status_t SendWebPage(uint8_t ledIsOn, float temperature);
+
+/* Private variables ---------------------------------------------------------*/
+Serial pc(SERIAL_TX, SERIAL_RX);
+static   uint8_t http[1024];
+static   uint8_t resp[1024];
+uint16_t respLen;
+uint8_t  IP_Addr[4];
+uint8_t  MAC_Addr[6];
+int32_t  Socket = -1;
+static   WebServerState_t  State = WS_ERROR;
+char     ModuleName[32];
+DigitalOut led(LED2);
+AnalogIn adc_temp(ADC_TEMP);
+
+int main()
+{
+    int ret = 0;
+    led = 0;
+    pc.baud(115200);
+    printf("****************************************************************\n");
+    printf("\r***                       Starting!!!                        ***\n");
+    printf("\r***           WIFI Web Server Smart Attendance System        ***\n\n");
+    printf("\r***       Copy the IP address on another device connected    ***\n");
+    printf("\r***               Go to Webpage to see Attendance            ***\n");
+    printf("\r***  Professor Scans Tag and Students will be able to Write  ***\n");
+    printf("\r***        their RFID TAG and Update the Class Status        ***\n");
+    printf("\r****************************************************************\n");
+    printf("\n");
+
+    /* Working application */
+    ret = wifi_sample_run();
+
+    if (ret != 0) 
+    {
+        return -1;
+    }
+    while(1) 
+    {
+        WebServerProcess ();
+    }
+}
+
+int wifi_sample_run(void)
+{
+    /*Initialize and use WIFI module */
+    if(WIFI_Init() ==  WIFI_STATUS_OK) 
+    {
+        printf("\rWi-Fi module Inventek ISM43362-M3G-L44 Initialized.\n");
+
+        if(WIFI_GetMAC_Address(MAC_Addr) == WIFI_STATUS_OK) 
+        {
+            printf("\r>ISM43362-wifi module MAC Address: %X:%X:%X:%X:%X:%X\n",
+                   MAC_Addr[0],
+                   MAC_Addr[1],
+                   MAC_Addr[2],
+                   MAC_Addr[3],
+                   MAC_Addr[4],
+                   MAC_Addr[5]);
+        } 
+        else 
+        {
+            printf("\r>ERROR: CANNOT get MAC address\n");
+        }
+
+        if( WIFI_Connect(MBED_CONF_APP_WIFI_SSID, MBED_CONF_APP_WIFI_PASSWORD, WIFI_ECN_WPA2_PSK) == WIFI_STATUS_OK) 
+        {
+            printf("\r>ISM43362-wifi module connected \n");
+
+            if(WIFI_GetIP_Address(IP_Addr) == WIFI_STATUS_OK) 
+            {
+                printf("\r>ISM43362-wifi module got IP Address: %d.%d.%d.%d\n",
+                       IP_Addr[0],
+                       IP_Addr[1],
+                       IP_Addr[2],
+                       IP_Addr[3]);
+
+                printf("\r>Starting HTTP Server...\n");
+                printf("\r>HTTP Server Ready...\n");
+                printf("\r>Waiting for Professor...\n");
+                State = WS_IDLE;
+            } 
+            else 
+            {
+                printf("\r>ERROR: ISM43362-wifi module CANNOT get IP address\n");
+                return -1;
+            }
+        } 
+        else 
+        {
+            printf("\r>ERROR: ISM43362-wifi module NOT connected\n");
+            return -1;
+        }
+    } 
+    else 
+    {
+        printf("\r>ERROR: WIFI Module cannot be initialized.\n");
+        return -1;
+    }
+    return 0;
+}
+
+/**
+  * @brief  Send HTML page
+  * @param  None
+  * @retval None
+  */
+static void WebServerProcess(void)
+{
+    uint8_t LedState = 0;
+    float temp;
+    switch(State) 
+    {
+        case WS_IDLE:
+            Socket = 0;
+            WIFI_StartServer(Socket, WIFI_TCP_PROTOCOL, "", PORT);
+
+            if(Socket != -1) 
+            {
+                printf("\r>HTTP Server Started \n");
+                State = WS_CONNECTED;
+            } 
+            else 
+            {
+                printf("\r>ERROR: Connection cannot be established.\n");
+                State = WS_ERROR;
+            }
+            break;
+
+        case WS_CONNECTED:
+
+            WIFI_ReceiveData(Socket, resp, 1200, &respLen, WIFI_READ_TIMEOUT);
+
+            if( respLen > 0) 
+            {
+                if(strstr((char *)resp, "GET")) 
+                { /* GET: put web page */
+                    temp = (adc_temp.read()*100);
+                    if(SendWebPage(LedState, temp) != WIFI_STATUS_OK) 
+                    {
+                        printf("\r>ERROR: Cannot send web page\n");
+                        State = WS_ERROR;
+                    }
+                } 
+                else if(strstr((char *)resp, "POST")) 
+                { /* POST: received info */
+                    if(strstr((char *)resp, "radio")) 
+                    {
+                        if(strstr((char *)resp, "radio=0")) 
+                        {
+                            LedState = 0;
+                            led = 0;
+                        } 
+                        else if(strstr((char *)resp, "radio=1")) 
+                        {
+                            LedState = 1;
+                            led = 1;
+                        }
+
+                        temp = (adc_temp.read()*100);
+                        if(SendWebPage(LedState, temp) != WIFI_STATUS_OK) 
+                        {
+                            printf("\r>ERROR: Cannot send web page\n");
+                            State = WS_ERROR;
+                        }
+                    }
+                }
+            }
+            if(WIFI_StopServer(Socket) == WIFI_STATUS_OK) 
+            {
+                WIFI_StartServer(Socket, WIFI_TCP_PROTOCOL, "", PORT);
+            } 
+            else 
+            {
+                State = WS_ERROR;
+            }
+            break;
+        case WS_ERROR:
+        default:
+            break;
+    }
+}
+
+/**
+  * @brief  Send HTML page
+  * @param  None
+  * @retval None
+  */
+static WIFI_Status_t SendWebPage(uint8_t ledIsOn, float temperature)
+{
+    uint8_t  temp[50];
+    uint16_t SentDataLength;
+    WIFI_Status_t ret;
+    
+    //constructs web page content
+    strcpy((char *)http, (char *)"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nPragma: no-cache\r\n\r\n");
+    strcat((char *)http, (char *)"<!DOCTYPE html>");
+    strcat((char *)http, (char *)"<html><head><title>KSU Attendance Server</title><style>");
+    strcat((char *)http, (char *)".jumbotron{margin: 1% 3% 1% 3%; border: 1px solid none; border-radius: 30px; background-color: #000000;}");
+    strcat((char *)http, (char *)".dataWindow{margin: 1% 3% 1% 3%; border: 1px solid none; border-radius: 30px; background-color: #000000;padding: 1% 1% 1% 1%;}");
+    strcat((char *)http, (char *)"</style></head><body style=\"background-color: #E6E6E6\">");
+    strcat((char *)http, (char *)"<div class=\"jumbotron\"><div style=\"text-align: center\"> <h1><p><font color=gold> KSU Smart Attendance System </font></p></h1> </div> ");
+    strcat((char *)http, (char *)"</div><div class=\"dataWindow\"><div style=\"text-align: center\"> <h2><font color=gold> User A </font></h2>");
+
+    /* construct web page content */
+    /*strcpy((char *)http, (char *)"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nPragma: no-cache\r\n\r\n");
+    strcat((char *)http, (char *)"<html>\r\n<body>\r\n");
+    strcat((char *)http, (char *)"<title>KSU Attendance Server</title>\r\n");
+    strcat((char *)http, (char *)"<h2>&nbsp;&nbsp;KSU Smart Attendance System: <br />Web Server using ISM43362-Wifi with B-L475E-IOT01A2</h2>\r\n");
+    strcat((char *)http, (char *)"<br /><hr>\r\n");
+    strcat((char *)http, (char *)"<p><form method=\"POST\"><strong>Number of Students in Class <input type=\"text\" size=2 value=\"");
+    sprintf((char *)temp, "%f", temperature);
+    strcat((char *)http, (char *)temp);*/
+
+    if (ledIsOn) 
+    {
+        strcat((char *)http, (char *)"<p><input type=\"radio\" name=\"radio\" value=\"0\" >Administrator: No");
+        strcat((char *)http, (char *)"<br><input type=\"radio\" name=\"radio\" value=\"1\" checked>Admin ok");
+    } 
+    else 
+    {
+        strcat((char *)http, (char *)"<p><input type=\"radio\" name=\"radio\" value=\"0\" checked>Administrator: Yes");
+        strcat((char *)http, (char *)"<br><input type=\"radio\" name=\"radio\" value=\"1\" >Administrator: No");
+    }
+
+    strcat((char *)http, (char *)"</strong><p><input type=\"submit\"></form></span>");
+    strcat((char *)http, (char *)"</body>\r\n</html>\r\n");
+
+    ret = WIFI_SendData(0, (uint8_t *)http, strlen((char *)http), &SentDataLength, WIFI_WRITE_TIMEOUT);
+
+    if((ret == WIFI_STATUS_OK) && (SentDataLength != strlen((char *)http))) 
+    {
+        ret = WIFI_STATUS_ERROR;
+    }
+    return ret;
+}
